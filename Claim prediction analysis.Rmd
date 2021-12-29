@@ -1,0 +1,393 @@
+---
+title: "Premium Prediction"
+author: "Ben Zhang"
+date: "2021/12/23"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+    code_folding: hide
+---
+
+\newpage 
+
+# Introduction
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(RSQLite)
+library(gridExtra)
+library(insuranceData)
+```
+
+In this notebook I will use the `swautoins` dataset from the `CASdatasets` R package and estimate claim amounts and frequency. I will be using SQL and Dplyr to store and manipulate data. Then I will be using regression models (multiple linear regression and generalized linear regression) to model the data and estimate expected pure premiums for each tariff cell. 
+
+I'm applying what I have learned from a similar project in ACTSC 431 - Property and Casualty, Pricing at the University of Waterloo. This time I will be dealling with a less tidy dataset so I can practice SQL and dpylr. I will also experiment with the ggplot2 library instead of base R graphics 
+
+# Preparing the Data
+
+## SQLite Database
+
+Although it is not necessary to use a database here, lets pretend we will do so for the convenience of adding new data down the line. I mostly just wanted to practice working with SQL in a project. 
+
+We create a SQLite database and add a dataset called 'autoclaims' into the db. 
+
+```{r}
+swautoins = read.csv("C:/Users/bben555/Desktop/spring 2021/actsc 432/swautoins.csv")
+
+swautoins = swautoins %>% select(-'X')
+
+conn = dbConnect(RSQLite::SQLite(), 'claim_data.db')
+
+dbWriteTable(conn, 'swautoins', value = swautoins, overwrite = TRUE)
+dbListTables(conn)
+```
+
+This dataset includes the auto insurance data collected in 1977 in Sweden by the Swedish Committee on the Analysis of Risk Premium. There are 7 variables and total of 1703 rows in the dataframe. Here we get a list of columns included:
+
+```{r}
+swautoins %>% colnames()
+```
+
+There are 4 rating factors: Kilometres, Zone, Bonus and Make. Kilometres has
+5 categories, while Zone, Bonus and Make all have 7 categories.
+
+Let's create an example view in the database that includes the top 100 tariff cells with the most payments. We will extract it as a dataframe and print the head.
+
+```{r}
+dbExecute(conn, 'CREATE VIEW IF NOT EXISTS mostpayment AS SELECT * FROM swautoins ORDER BY Payment DESC LIMIT 100')
+mostpayment = dbGetQuery(conn, 'SELECT * FROM mostpayment')
+
+head(mostpayment)
+```
+
+Operation to insert and remove dummy rows in the SQLite table:
+
+```{r}
+
+#Inserting rows
+dbExecute(conn, 'INSERT INTO swautoins (Kilometres, Zone, Bonus) VALUES (?, ?, ?)', params = list(c('6','6','6'), c('1','1','2'), c('2','5','5')))
+
+#Deleting the added rows
+dbExecute(conn, 'DELETE FROM swautoins WHERE rowid = ?', params = 1704) 
+dbExecute(conn, 'DELETE FROM swautoins WHERE rowid = ?', params = 1705) 
+dbExecute(conn, 'DELETE FROM swautoins WHERE rowid = ?', params = 1706) 
+```
+
+Above are the basic CRUD (create, read, update, delete) operations using SQLite. 
+
+## Exploratory Analysis
+
+```{r}
+summary(swautoins)
+```
+
+There are no NAs in this dataset. 
+
+Let's plot the distribution of payments, claims counts, and exposure/duration with respect to the four rating factors.
+
+```{r}
+payment_by_kilo = swautoins %>% group_by(Kilometres) %>% summarise(Payment = sum(Payment))
+payment_by_zone = swautoins %>% group_by(Zone) %>% summarise(Payment = sum(Payment))
+payment_by_bonus = swautoins %>% group_by(Bonus) %>% summarise(Payment = sum(Payment))
+payment_by_Make = swautoins %>% group_by(Make) %>% summarise(Payment = sum(Payment))
+
+p1 = ggplot(payment_by_kilo, aes(x=Kilometres, y=Payment)) + geom_bar(stat='identity')
+p2 = ggplot(payment_by_zone, aes(x=Zone, y=Payment)) + geom_bar(stat='identity')
+p3 = ggplot(payment_by_bonus, aes(x=Bonus, y=Payment)) + geom_bar(stat='identity')
+p4 = ggplot(payment_by_Make, aes(x=Make, y=Payment)) + geom_bar(stat='identity')
+
+p1.1 = ggplot(swautoins, aes(Kilometres, Insured)) + geom_bar(stat='identity')
+p2.1 = ggplot(swautoins, aes(Zone, Insured)) + geom_bar(stat='identity')
+p3.1 = ggplot(swautoins, aes(Bonus, Insured)) + geom_bar(stat='identity')
+p4.1 = ggplot(swautoins, aes(Make, Insured)) + geom_bar(stat='identity')
+
+p1.2 = ggplot(swautoins, aes(Kilometres, Claims)) + geom_bar(stat='identity')
+p2.2 = ggplot(swautoins, aes(Zone, Claims)) + geom_bar(stat='identity')
+p3.2 = ggplot(swautoins, aes(Bonus, Claims)) + geom_bar(stat='identity')
+p4.2 = ggplot(swautoins, aes(Make, Claims)) + geom_bar(stat='identity')
+
+grid.arrange(p1,p1.1,p1.2,p2,p2.1,p2.2,p3,p3.1,p3.2,p4,p4.1,p4.2, ncol=3)
+```
+
+In the kilometre rating factor, class 2 and 3 has the most exposure/duration therefore the most sum of claims and payments.
+
+In the zone rating factor, zone 4 has the most exposure and claims and payments. Notice that zone 1 has one of the least exposures but the claims and payments stands out as some of the highest. 
+
+In the bonus rating factor, majority of exposures is in class 7. Similarly, class 1 has one of the least exposures but the claims and payments stands out as one of the highest.
+
+In the make rating factor, majority of exposures is in class 7. It has the most sum of claims and payments. 
+
+# Regression Analysis
+
+Lets factorize the rating factors and set the tariff cell with the longest duration as the base:
+
+```{r}
+swautoins= within(swautoins, {
+    Kilometres = factor(Kilometres)
+    Zone = factor(Zone)
+    Bonus = factor(Bonus)
+    Make = factor(Make)
+})
+
+basecell = swautoins[which.max(swautoins$Insured),]
+
+basecell
+
+swautoins$Kilometres =relevel(swautoins$Kilometres, as.character(basecell$Kilometres))
+swautoins$Zone=relevel(swautoins$Zone, as.character(basecell$Zone))
+swautoins$Bonus=relevel(swautoins$Bonus, as.character(basecell$Bonus))
+swautoins$Make=relevel(swautoins$Make, as.character(basecell$Make))
+```
+
+## Claim Frequency
+
+We will use a poisson GLM model with insured as an offset and a canonical log link to model claim frequency. We will first fit a crude model with all the rating factors
+
+```{r}
+freq = glm(Claims ~ Kilometres + Zone + Bonus + Make + offset(log(Insured)), family=poisson("log"), data=swautoins[swautoins$Insured > 0,])
+
+freq %>% summary()
+```
+
+From the summary object we see that all of the predictors are significant as the p-values for them are all below the significance level. The effects on claim frequency is also quite strong for a lot of the predictors. We will use a deviance test to see the fit of the model.
+
+```{r}
+cbind(scaled.deviance=freq$deviance,df=freq$df.residual,p=1-pchisq(freq$deviance,freq$df.residual))
+```
+
+The p-value of the deviance test is virtually 0. Therefore this is not a good fitting model.
+
+We will now try splitting the data into 2 sets and check the fit of poisson glm.
+
+```{r}
+# tariff cells in Set 1.
+swautoins=read.csv("C:/Users/bben555/Desktop/spring 2021/actsc 432/swautoins.csv")
+swautoins_set1=swautoins[(swautoins$Bonus<=5) | (swautoins$Zone<=4),]
+
+# turn the rating factors into categorical variables
+swautoins_set1 = within(swautoins_set1, {
+    Kilometres = factor(Kilometres)
+    Zone = factor(Zone)
+    Bonus = factor(Bonus)
+    Make = factor(Make)
+})
+
+# change the base cell
+basecell= swautoins_set1[which.max(swautoins_set1$Insured),]
+swautoins_set1$Kilometres=relevel(swautoins_set1$Kilometres, as.character(basecell$Kilometres))
+swautoins_set1$Zone=relevel(swautoins_set1$Zone, as.character(basecell$Zone))
+swautoins_set1$Bonus=relevel(swautoins_set1$Bonus, as.character(basecell$Bonus))
+swautoins_set1$Make=relevel(swautoins_set1$Make, as.character(basecell$Make))
+
+
+# relative Poisson glm model
+freq.set1 =glm(Claims ~ Kilometres + Zone + Bonus + Make + offset(log(Insured)), family=poisson("log"), data=swautoins_set1[swautoins_set1$Insured > 0,])
+
+freq.set1 %>% summary()
+
+# deviance
+cbind(scaled.deviance=freq.set1$deviance,df=freq.set1$df.residual,p=1-pchisq(freq.set1$deviance,freq.set1$df.residual))
+```
+
+For the tariff cells in Set 1, we obtain a p-value of virtually 0 which implies that the relative Poisson glm does not fit well the data.
+
+```{r}
+# repeat the same process for tariff cells in Set 2.
+swautoins=read.csv("C:/Users/bben555/Desktop/spring 2021/actsc 432/swautoins.csv")
+swautoins_set2= swautoins[(swautoins$Bonus>5) & (swautoins$Zone>4),]
+swautoins_set2 = within(swautoins_set2, {
+    Kilometres = factor(Kilometres)
+    Zone = factor(Zone)
+    Bonus = factor(Bonus)
+    Make = factor(Make)
+})
+
+basecell= swautoins_set2[which.max(swautoins_set2$Insured),]
+swautoins_set2$Kilometres =relevel(swautoins_set2$Kilometres, as.character(basecell$Kilometres))
+swautoins_set2$Zone=relevel(swautoins_set2$Zone, as.character(basecell$Zone))
+swautoins_set2$Bonus=relevel(swautoins_set2$Bonus, as.character(basecell$Bonus))
+swautoins_set2$Make=relevel(swautoins_set2$Make, as.character(basecell$Make))
+
+freq.set2 =glm(Claims ~ Kilometres + Zone + Bonus + Make + offset(log(Insured)), family=poisson("log"), data=swautoins_set2[swautoins_set2$Insured > 0,])
+
+summary(freq.set2)
+
+cbind(scaled.deviance=freq.set2$deviance,df=freq.set2$df.residual,p=1-pchisq(freq.set2$deviance,freq.set2$df.residual))
+```
+
+For the tariff cells in Set 2, we obtain a p-value of 0.2671894 which implies that we do not reject the null hypothesis that the relative Poisson glm fits the data well. Hence, the relative Poisson model is more appropriate for the tariff cells in Set 2 (than those in Set 1). 
+
+In this model, Make1 is deemed as not significant. Lets try dropping the rating factor `Make` to see if it is a better fitting model.
+
+```{r}
+# relative Poisson glm model for Set 2 without the rating factor Make
+freq.set2.wMake =glm(Claims ~ Kilometres + Zone + Bonus + offset(log(Insured)), family=poisson("log"), data=swautoins_set2[swautoins_set2$Insured > 0,])
+
+freq.set2.wMake %>% summary()
+
+# likelihood ratio test H0: all betas of the rating factor "Make" are 0, Ha: at least one beta of the rating factor "Make" is different than 0
+
+anova(freq.set2.wMake,freq.set2, test = 'LRT')
+
+```
+
+Since the p-value is 6.244e-14, we are not statistically justified to simplify the model by dropping the variable Make. Lets instead try grouping Make 1 and 3 into the base Make level 7. 
+
+```{r}
+# merge categories 1, 3 and 7 of Make into one category
+
+levels(swautoins_set2$Make)=recode(levels(swautoins_set2$Make), "1"="1&3&7")
+levels(swautoins_set2$Make)=recode(levels(swautoins_set2$Make), "3"="1&3&7")
+levels(swautoins_set2$Make)=recode(levels(swautoins_set2$Make), "7"="1&3&7")
+
+# merge categories 2 and 5 of Make into one category
+
+levels(swautoins_set2$Make)=recode(levels(swautoins_set2$Make), "2"="2&5")
+levels(swautoins_set2$Make)=recode(levels(swautoins_set2$Make), "5"="2&5")
+
+# relative Poisson glm model
+
+freq.set2.mMake =glm(Claims ~ Kilometres + Zone + Bonus + Make + offset(log(Insured)), family=poisson, data=swautoins_set2[swautoins_set2$Insured > 0,])
+
+freq.set2.mMake %>% summary()
+
+# likelihood ratio test
+
+anova(freq.set2.mMake,freq.set2, test = 'LRT')
+
+```
+
+For this alternative simplified model, the p-value of the likelihood ratio test is 0.1363605. We are statistically justified to simplify `freq.set2` to `freq.set2.mMake`.
+
+## Claim Severity
+
+Let's focus on only data in set 2 while modeling claim severity.
+
+```{r}
+# reload the dataset and extract only tariff cells in Set 2
+
+swautoins=read.csv("C:/Users/bben555/Desktop/spring 2021/actsc 432/swautoins.csv")
+swautoins_set2 = swautoins[(swautoins$Bonus>5) & (swautoins$Zone>4),]
+
+# turn the rating factors into categorical variables
+
+swautoins_set2 = within(swautoins_set2, {
+    Kilometres = factor(Kilometres)
+    Zone = factor(Zone)
+    Bonus = factor(Bonus)
+    Make = factor(Make)
+})
+
+# change the base tariff cell
+
+basecell= swautoins_set2[which.max(swautoins_set2$Insured),]
+swautoins_set2$Kilometres =relevel(swautoins_set2$Kilometres, as.character(basecell$Kilometres))
+swautoins_set2$Zone=relevel(swautoins_set2$Zone, as.character(basecell$Zone))
+swautoins_set2$Bonus=relevel(swautoins_set2$Bonus, as.character(basecell$Bonus))
+swautoins_set2$Make=relevel(swautoins_set2$Make, as.character(basecell$Make))
+```
+
+### Multiple Linear Regression
+
+Let's first try fitting a multiple linear regression model. This will assume the response, severity per claim, is normally distributed.
+
+```{r}
+sev.norm = lm(Payment/Claims ~ Kilometres + Zone + Bonus + Make, data = swautoins_set2[swautoins_set2$Claims > 0, ], weights = Claims)
+
+summary(sev.norm)
+
+c(R_Squared = summary(sev.norm)$r.squared)
+
+summary(sev.simpl <- glm(Payment/Claims ~ Zone + Make, family = Gamma("log"), data = swautoins_set2[swautoins_set2$Claims > 0, ], weights = Claims))
+```
+
+The $R^2$ of the linear regression model is very poor. The predictors are not significant except for Zone 5 and Make 5.
+
+### Gamma GLM
+
+Now we will check the fit of a gamma glm model. 
+
+```{r}
+# gamma glm model
+# Note that the response variable is Payment/Claims, which measures the average claim amount per claim.
+# We use weights because data was a sum of gamma variables.
+sev = glm(Payment/Claims ~ Kilometres + Zone + Bonus + Make, family = Gamma("log"), data = swautoins_set2[swautoins_set2$Claims > 0, ], weights = Claims)
+
+summary(sev)
+
+# deviance (deviance/dispersion)
+sev.phi=summary(sev)$dispersion
+cbind(scaled.deviance = sev$deviance/sev.phi, df = sev$df.residual, p = 1-pchisq(sev$deviance/sev.phi, sev$df.residual))
+```
+
+Except for Make 5 and possibly Zone 5, all the other tariff factors do not seem to be significant to predict the severity key ratio in the tariff cells in Set 2. As measured by the deviance statistic, the gamma glm fit seems to be quite good as the p-value is of 0.9660689. 
+
+Let's compare the model above to a model where we group all categories except for zone 5 and make 5 into the base category.
+
+```{r}
+
+# group all categories (except 5) of Zone into the base category of Zone (Zone 6)
+swautoins_set2$Zone[swautoins_set2$Zone != "5"] <- 6
+
+# group all categories (except 5) of Make into the base category of Make (Make 7)
+swautoins_set2$Make[swautoins_set2$Make!= "5"] <- 7
+
+# gamma glm severity model
+summary(sev.simpl <- glm(Payment/Claims ~ Zone + Make, family = Gamma("log"), data = swautoins_set2[swautoins_set2$Claims > 0, ], weights = Claims))
+
+# likelihood ratio test 
+anova(sev.simpl,sev, test = 'LRT')
+
+```
+
+Since the p-value is of 0.9636, we are statistically justified to simplify `sev` to `sev.simpl`.
+
+# Predictions & Conclusion
+
+After fitting the models, we found two statistically significant GLM models that fits the claim frequency and severity of the swautoins dataset. 
+
+The expected key ratio is the the ratio of a rating factor level compared to the base level. Multiplying the expected key frequency ratio with key severity ratio will give us the expected pure premium of a tariff cell. 
+
+```{r}
+# print the relativities of key frequency ratio of claim freq
+exp(freq.set2.mMake$coefficients)
+
+# print the relativities of key severity ratio of claim sev
+exp(sev.simpl$coefficients)
+
+```
+
+Let's calculated the expected pure premium of the cell (Kilometres=5, Zone=7, Bonus=7 and Make=4).
+
+The expected key frequency ratio of the cell (Kilometres=5, Zone=7, Bonus=7 and Make=4) is:
+
+```{r}
+0.0295096*1.2431803*0.8105850*1*0.6107446
+```
+
+The expected key severity ratio of the cell (Kilometres=5, Zone=7, Bonus=7 and Make=4) is:
+
+```{r}
+5591.2344401*1*1*1*1
+```
+
+The expected pure premium of the cell (Kilometres=5, Zone=7, Bonus=7 and Make=4) is: 
+
+```{r}
+0.01816166*5591.234
+```
+
+Compare the result to the actual observed payments:
+
+```{r}
+swautoins %>% filter(Kilometres == 5, Zone == 7, Bonus == 7, Make == 4) 
+```
+
